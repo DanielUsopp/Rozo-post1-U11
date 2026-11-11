@@ -1,7 +1,7 @@
 # Refactoring U11 — Refactorización Guiada por Pruebas
 
 ## Descripción
-Repositorio del post-contenido de la Unidad 11 de Patrones de Diseño de Software. Un único proyecto Spring Boot (`refactoring-u11`, solo `spring-boot-starter`) con un servicio de inventario que parte con dos code smells reales. La Parte 1 blinda el comportamiento con pruebas de caracterización y después elimina los dos smells, verificando con esas mismas pruebas que el comportamiento observable no cambió.
+Repositorio del post-contenido de la Unidad 11 de Patrones de Diseño de Software. Un único proyecto Spring Boot (`refactoring-u11`, solo `spring-boot-starter`) con un servicio de inventario que parte con dos code smells reales. La Parte 1 blinda el comportamiento con pruebas de caracterización y después elimina los dos smells, verificando con esas mismas pruebas que el comportamiento observable no cambió. La Parte 2 agrega un módulo de reportes cuya integración crea un ciclo entre paquetes, lo detecta con ArchUnit, lo resuelve con inversión de dependencias y vuelve a correr las pruebas de la Parte 1 sin modificarlas.
 
 ## Parte 1 — Red de seguridad y refactorización guiada por evidencia
 
@@ -135,11 +135,78 @@ Relying upon circular references is discouraged and they are prohibited by defau
 
 ArchUnit detecta el ciclo entre paquetes leyendo el bytecode; Spring detecta el ciclo entre objetos al intentar construirlos. Son dos problemas relacionados pero distintos, y la Parte 2 tiene que resolver los dos.
 
+## Parte 2 — Resolución
+
+### Paso 1: invertir la dependencia entre paquetes
+Se extrajo la interfaz `NotificadorBajoStock` en el paquete `inventario`. `InventarioService` dejó de importar cualquier clase de `reportes` y ahora depende solo de la interfaz (`setNotificador`, con `@Autowired(required = false)` para no tocar el constructor que usan las pruebas). `ReporteBajoStockService` implementa la interfaz, de modo que la única flecha que queda va de `reportes` a `inventario`:
+
+```
+   ┌────────────────────────────────┐                     ┌──────────────────────────┐
+   │           inventario           │                     │         reportes         │
+   │  InventarioService             │                     │                          │
+   │      │ usa                     │   implementa        │  ReporteBajoStockService │
+   │      ▼                         │ ◀────────────────── │                          │
+   │  «interface»                   │                     │  AlertaReorden           │
+   │  NotificadorBajoStock          │                     │                          │
+   └────────────────────────────────┘                     └──────────────────────────┘
+```
+
+Con este commit `ArquitecturaPaquetesTest` pasó a verde:
+
+```
+$ mvn test -Dtest=ArquitecturaPaquetesTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+### Paso 2: el ciclo que la prueba de arquitectura no ve
+Con los paquetes ya sin ciclo, `contextLoads` seguía fallando. En el código del enunciado, `ReporteBajoStockService` conserva su constructor con `InventarioService` para consultar los productos bajo el mínimo, así que en ejecución el ciclo seguía ahí: `InventarioService → NotificadorBajoStock (que es ReporteBajoStockService) → InventarioService`. ArchUnit no lo marca porque la regla es sobre paquetes y la flecha `reportes → inventario` está permitida; Spring sí, porque construye objetos.
+
+Se resolvió quitando la causa en vez de esconderla. El reporte ya no le pregunta nada al inventario: cada notificación trae el producto y la cantidad a reordenar, y `ReporteBajoStockService` guarda la última alerta de cada producto (`AlertaReorden`) para armar el reporte. Con eso desaparecieron el constructor con `InventarioService` y el método `productosBajoStockMinimo()`, que solo existía para esa consulta. Se descartaron dos alternativas que hacían arrancar la aplicación sin cambiar el diseño: `spring.main.allow-circular-references=true`, que el propio mensaje de Spring califica como último recurso, y `@Lazy` sobre la dependencia, que pospone la creación del bean pero deja el ciclo intacto.
+
+`NotificacionBajoStockContextoTest` (`@SpringBootTest`) confirma el flujo completo con el contexto real: una salida que deja un producto bajo el mínimo devuelve `OK_BAJO_STOCK_REORDEN_9` y el reporte contiene la línea de ese producto.
+
+### Paso 3: las pruebas de la Parte 1 sin modificar
+```
+$ mvn test
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in ...ArquitecturaPaquetesTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in ...reportes.ReporteBajoStockServiceTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in ...NotificacionBajoStockContextoTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in ...RefactoringU11ApplicationTests
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in ...inventario.CalculadoraReordenTest
+[INFO] Tests run: 13, Failures: 0, Errors: 0, Skipped: 0 -- in ...inventario.InventarioServiceTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0 -- in ...inventario.ClasificadorProductoTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in ...inventario.EtiquetadoProductoTest
+[INFO] Tests run: 29, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+Las 22 pruebas de caracterización pasan sin haberse tocado desde el commit `6057c48`. La reestructuración de paquetes no cambió el comportamiento observable del inventario.
+
+### Historial de `mvn test` en la Parte 2
+| Commit | ArquitecturaPaquetesTest | contextLoads | Pruebas de la Parte 1 |
+|--------|--------------------------|--------------|------------------------|
+| `feat: agregar modulo de reportes...` | (aún no existe) | Falla: ciclo de beans | Verde |
+| `test: agregar prueba de arquitectura... (en rojo)` | Falla: ciclo inventario ↔ reportes | Falla | Verde |
+| `refactor: invertir la dependencia...` | Verde | Falla: el ciclo sigue entre objetos | Verde |
+| `fix: romper el ciclo entre beans...` | Verde | Verde | Verde |
+
+### Decisión de diseño 3 — `NotificadorBajoStock` vive en `inventario`
+La regla de la guía (sección 4.3) es que los paquetes de infraestructura dependen del dominio y el dominio nunca depende de infraestructura. En este proyecto `inventario` es el dominio y el paquete de mayor nivel: tiene las reglas de negocio (stock, reorden, tipos de producto) y no le debería importar quién se entera de un bajo stock ni qué hace con eso. `reportes` es un consumidor de esos eventos, de menor nivel: mañana podría haber otro, como un correo a compras, sin que `inventario` cambie. La interfaz expresa lo que el dominio necesita ("avisar que un producto está bajo el mínimo y cuánto reordenar"), así que pertenece a quien la usa y no a quien la implementa. Si se hubiera puesto en `reportes`, `InventarioService` seguiría importando `reportes` y el ciclo no se habría roto, solo se habría movido de clase.
+
+### Decisión de diseño 4 — Notificación por evento individual
+Se mantuvo `notificar(Producto, int cantidadReorden)`, un aviso por producto en el momento en que cruza el mínimo, y no `notificar(List<Producto>)`.
+
+- **Ventajas en este diseño.** El aviso sale exactamente donde ocurre el hecho, dentro de `alertarBajoStock`, sin que el inventario tenga que acumular nada ni decidir cuándo "cerrar" un lote. Además, cada aviso trae los datos completos (producto y cantidad), y eso fue lo que permitió quitar la consulta de `reportes` hacia `inventario` y romper el ciclo de beans. Con notificaciones por lote, el inventario necesitaría un búfer y un disparador (un temporizador o un fin de proceso), es decir, más estado y más código en el dominio.
+- **Cuándo convendría por lote.** Cuando cada aviso tiene un costo alto o el destinatario prefiere un resumen: por ejemplo, si el notificador enviara un correo a compras o llamara a la API de un proveedor, cien salidas seguidas generarían cien mensajes; un resumen diario o un cierre de inventario nocturno con `notificar(List<Producto>)` sería más razonable. También cuando el consumidor tiene que ver todos los productos juntos para decidir, como una orden de compra consolidada por proveedor.
+
 ## Ejecutar las pruebas
 ```bash
 mvn test
 ```
 
 ## Herramientas utilizadas
-- Java 17, Spring Boot 3.3, JUnit 5
+- Java 17, Spring Boot 3.3, JUnit 5, ArchUnit 1.3.0
 - JaCoCo (medición de complejidad por método), Apache Maven, Git, GitHub
+
+## Conclusiones
+Escribir primero las pruebas de caracterización cambió la forma de refactorizar: no se trataba de dejar el código "como debería ser", sino de cambiar su estructura sin alterar lo que hace, incluidos comportamientos poco deseables como aceptar una entrada negativa. Esas pruebas fueron las que obligaron a conservar detalles que un refactor descuidado habría cambiado. En el switch duplicado, la decisión más útil fue separar lo que es dato (los textos de la etiqueta) de lo que es comportamiento (la fórmula del recargo), en lugar de convertir todo en métodos. La Parte 2 mostró que un ciclo puede existir en dos niveles: ArchUnit lo encontró entre paquetes y la inversión de dependencias lo resolvió, pero el ciclo entre objetos solo desapareció cuando el reporte dejó de consultar al inventario y pasó a usar los datos que ya traía cada notificación.
