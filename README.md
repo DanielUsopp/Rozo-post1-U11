@@ -93,6 +93,48 @@ Dentro del enum se distinguió entre lo que es **dato** y lo que es **comportami
 - **La etiqueta es dato.** Las cuatro tienen el mismo formato `[PREFIJO] nombre - leyenda`, así que cada constante guarda su prefijo y su leyenda y el formato vive en un solo método, `etiquetaPara`. Escribir cuatro métodos que solo cambian un texto habría repetido el formato cuatro veces.
 - **El recargo es comportamiento.** Tres tipos lo calculan como porcentaje del precio y `ALIMENTO` cobra un monto fijo que no depende del precio. Por eso es un método abstracto que cada constante implementa.
 
+## Parte 2 — Diagnóstico del acoplamiento entre paquetes
+
+### El ciclo
+El módulo `reportes` se integró como pide el enunciado: `InventarioService` recibe por setter un `ReporteBajoStockService` para avisarle cuando un producto queda bajo el mínimo, y `ReporteBajoStockService` recibe por constructor el `InventarioService` para consultar esos productos. El resultado son dos flechas en sentidos opuestos:
+
+```
+   ┌──────────────────────┐   importa ReporteBajoStockService   ┌──────────────────────┐
+   │      inventario      │ ──────────────────────────────────▶ │       reportes       │
+   │  InventarioService   │                                      │ ReporteBajoStock-    │
+   │                      │ ◀────────────────────────────────── │ Service              │
+   └──────────────────────┘     importa InventarioService        └──────────────────────┘
+```
+
+### Evidencia
+Salida de `mvn test -Dtest=ArquitecturaPaquetesTest` en este punto:
+
+```
+Architecture Violation [Priority: MEDIUM] - Rule 'slices matching 'com.universidad.refactoringu11.(*)..' should be free of cycles' was violated (1 times):
+Cycle detected: Slice inventario ->
+                Slice reportes ->
+  1. Dependencies of Slice inventario
+    - Field <...inventario.InventarioService.reporteBajoStockService> has type <...reportes.ReporteBajoStockService>
+    - Method <...inventario.InventarioService.alertarBajoStock(...)> calls method <...reportes.ReporteBajoStockService.generarReporte()>
+  2. Dependencies of Slice reportes
+    - Constructor <...reportes.ReporteBajoStockService.<init>(...inventario.InventarioService)> has parameter of type <...inventario.InventarioService>
+    - Method <...reportes.ReporteBajoStockService.generarReporte()> calls method <...inventario.InventarioService.productosBajoStockMinimo()>
+```
+
+Las pruebas de negocio de la Parte 1 (`InventarioServiceTest`, `ClasificadorProductoTest`, `EtiquetadoProductoTest`) siguen en verde con el ciclo presente: instancian `InventarioService` con `new` y nunca le asignan el colaborador, así que el `if (reporteBajoStockService != null)` evita que se note. El problema no es de comportamiento, es de estructura.
+
+Hubo una segunda evidencia que el enunciado no menciona: `contextLoads`, la prueba que genera Spring Initializr, empezó a fallar desde el commit del módulo de reportes. Spring no puede arrancar la aplicación porque los dos beans se necesitan mutuamente:
+
+```
+The dependencies of some of the beans in the application context form a cycle:
+   inventarioService
+      ↓
+   reporteBajoStockService
+Relying upon circular references is discouraged and they are prohibited by default.
+```
+
+ArchUnit detecta el ciclo entre paquetes leyendo el bytecode; Spring detecta el ciclo entre objetos al intentar construirlos. Son dos problemas relacionados pero distintos, y la Parte 2 tiene que resolver los dos.
+
 ## Ejecutar las pruebas
 ```bash
 mvn test
