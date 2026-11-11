@@ -26,12 +26,6 @@ public class InventarioService {
         productos.add(producto);
     }
 
-    public List<Producto> productosBajoStockMinimo() {
-        return productos.stream()
-                .filter(calculadoraReorden::necesitaReorden)
-                .toList();
-    }
-
     public String actualizarInventario(Long productoId, int cantidad, String tipoMovimiento) {
         if (datosDeEntradaInvalidos(productoId, cantidad, tipoMovimiento)) {
             return "ERROR_DATOS_INVALIDOS";
